@@ -53,6 +53,11 @@ from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 from typing_extensions import Literal, assert_never
 from utils import AppearanceOptModule, CameraOptModule, knn, rgb_to_sh, set_random_seed
 
+try:  # correctness recorder (run/probe); every call is a no-op unless PROBE=1
+    import probe
+except ImportError:  # pragma: no cover
+    probe = None
+
 from gsplat import export_splats
 from gsplat.compression import PngCompression
 from gsplat.distributed import cli
@@ -902,6 +907,8 @@ class Runner:
                 pixels.shape[0] * pixels.shape[1] * pixels.shape[2]
             )
             image_ids = data["image_id"].to(device)
+            if probe is not None and probe.enabled():
+                probe.record(f"image_id_step{step}", int(data["image_id"][0]))
             masks = data["mask"].to(device) if "mask" in data else None  # [1, H, W]
             exposure = (
                 data["exposure"].to(device) if "exposure" in data else None
@@ -943,6 +950,25 @@ class Runner:
             else:
                 colors, depths = renders, None
 
+            _probe_step = probe is not None and probe.enabled() and (
+                step < 10 or step % 50 == 0 or step == max_steps - 1
+            )
+            if _probe_step:
+                # Measured band (3 same-seed runs x 8 ranks of the untouched base):
+                # step 0 is bit-identical; steps 1-9 drift <=5e-4 from the atomic-add
+                # backward; from step 100 densification decisions diverge (num_gs up
+                # to 6 %, loss ~2 %). Tolerances are 3x the measured spread.
+                _t = (lambda tight, mid, loose: tight if step == 0 else mid if step < 10 else loose)
+                _tol_scalar = _t(0.0, 3e-4, 6e-2)   # loss, l1, ssim, renders absmean
+                _tol_absmax = _t(0.0, 2e-3, 4e-1)   # renders abs max
+                _tol_count = _t(0.0, 1e-4, 2e-1)    # visible / num_gs counts
+                _note = "band from 3 base runs x 8 ranks, 3x spread"
+                probe.record(f"renders_shape_step{step}", str(tuple(renders.shape)))
+                probe.record(f"alphas_shape_step{step}", str(tuple(alphas.shape)))
+                probe.record(f"visible_step{step}", int((info["radii"] > 0).sum().item()), rtol=_tol_count, note=_note)
+                probe.record_lazy(f"renders_absmean_step{step}", lambda: renders.detach().float().abs().mean(), rtol=_tol_scalar, note=_note)
+                probe.record_lazy(f"renders_absmax_step{step}", lambda: renders.detach().float().abs().max(), rtol=_tol_absmax, note=_note)
+
             if cfg.random_bkgd:
                 bkgd = torch.rand(1, 3, device=device)
                 colors = colors + bkgd * (1.0 - alphas)
@@ -975,6 +1001,10 @@ class Runner:
                 colors_ssim.permute(0, 3, 1, 2), pixels_ssim.permute(0, 3, 1, 2)
             )
             loss = torch.lerp(l1loss, ssimloss, cfg.ssim_lambda)
+            if _probe_step:
+                probe.record(f"loss_step{step}", loss.detach(), rtol=_tol_scalar, note=_note)
+                probe.record(f"l1loss_step{step}", l1loss.detach(), rtol=_tol_scalar, note=_note)
+                probe.record(f"ssimloss_step{step}", ssimloss.detach(), rtol=_tol_scalar, note=_note)
             if cfg.depth_loss:
                 # query depths from depth map
                 points = torch.stack(
@@ -1192,6 +1222,12 @@ class Runner:
                 )
             else:
                 assert_never(self.cfg.strategy)
+
+            if _probe_step:
+                probe.record(f"num_gs_step{step}", int(len(self.splats["means"])), rtol=_tol_count, note=_note)
+                if step == max_steps - 1:
+                    probe.flush()
+                    probe.set_enabled(False)  # the atexit flush would run after the process group is gone and drop the rank infix
 
             # eval the full set
             if step in [i - 1 for i in cfg.eval_steps]:
